@@ -26,8 +26,8 @@ client (initiator) and server (responder)** roles.
 - **Out of scope:** capturing a machine's real traffic (TUN device, SOCKS, etc.).
   `ryke` is a library; a consumer wires whatever packet source they want to
   `Tunnel::send`/`recv`.
-- **Consumers** (e.g. the Tunnelbrick node service) embed `ryke` as a library and
-  drive the initiator or responder role.
+- **Consumers** (e.g. a node/gateway service) embed `ryke` as a library and drive
+  the initiator or responder role.
 
 ## Module layout (`src/`)
 

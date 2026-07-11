@@ -27,7 +27,7 @@ fn full_handshake_over_udp_loopback() {
     let client_auth = AuthConfig::psk(Identification::fqdn("client.example"), psk);
     let mut client = Client::bind("127.0.0.1:0", SeedEntropy::new(0x5678)).unwrap();
     client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let (sa, server_id, mut client_child) = client.connect(server_addr, &client_auth, 0x1234_5678).unwrap();
+    let (sa, server_id, mut client_child, _assigned) = client.connect(server_addr, &client_auth, 0x1234_5678).unwrap();
 
     let (e1, e2, mut server) = handle.join().unwrap();
     assert!(matches!(e1, ServerEvent::SaInit { .. }));

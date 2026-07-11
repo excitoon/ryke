@@ -6,6 +6,8 @@
 //! payload header. Chaining payloads into a full message (adding those generic
 //! headers) is the message-builder's job.
 
+use std::net::Ipv4Addr;
+
 use crate::error::IkeError;
 
 /// Transform types (RFC 7296 §3.3.2).
@@ -259,7 +261,7 @@ pub mod id_type {
 }
 
 /// Identification payload body (RFC 7296 §3.5). IDi and IDr share this format.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Identification {
     pub id_type: u8,
     pub data: Vec<u8>,
@@ -293,6 +295,11 @@ pub mod auth_method {
     /// Shared Key Message Integrity Code (PSK).
     pub const SHARED_KEY: u8 = 2;
     pub const DSS_SIG: u8 = 3;
+    /// ECDSA-256 with SHA-256 on the P-256 curve (RFC 4754) — the *classic*
+    /// ECDSA auth, used when the peer does not negotiate RFC 7427 Digital
+    /// Signature (e.g. an iOS EAP client sends no SIGNATURE_HASH_ALGORITHMS).
+    /// AUTH Data is the raw `r || s` (64 bytes), no algorithm wrapper.
+    pub const ECDSA_SHA256_P256: u8 = 9;
     /// Digital Signature (RFC 7427) — the modern cert-auth method.
     pub const DIGITAL_SIGNATURE: u8 = 14;
 }
@@ -348,6 +355,19 @@ impl TrafficSelector {
             end_port: 65535,
             start_addr: vec![0, 0, 0, 0],
             end_addr: vec![255, 255, 255, 255],
+        }
+    }
+
+    /// A single-host IPv4 selector (a /32 range, any protocol/port) — what a
+    /// responder narrows TSi to when it assigns the initiator one address.
+    pub fn ipv4_host(addr: Ipv4Addr) -> Self {
+        TrafficSelector {
+            ts_type: ts_type::IPV4_ADDR_RANGE,
+            ip_protocol: 0,
+            start_port: 0,
+            end_port: 65535,
+            start_addr: addr.octets().to_vec(),
+            end_addr: addr.octets().to_vec(),
         }
     }
 
@@ -415,6 +435,122 @@ impl TrafficSelectors {
             ts.write(&mut out);
         }
         out
+    }
+}
+
+/// Configuration payload (CP) types (RFC 7296 §3.15.1).
+pub mod cfg_type {
+    pub const REQUEST: u8 = 1;
+    pub const REPLY: u8 = 2;
+    pub const SET: u8 = 3;
+    pub const ACK: u8 = 4;
+}
+
+/// Configuration Attribute types (RFC 7296 §3.15.1 + IANA registry). Only the
+/// IPv4 attributes a client needs to bring up a tunnel interface are named.
+pub mod config_attr {
+    pub const INTERNAL_IP4_ADDRESS: u16 = 1;
+    pub const INTERNAL_IP4_NETMASK: u16 = 2;
+    pub const INTERNAL_IP4_DNS: u16 = 3;
+    pub const INTERNAL_IP4_SUBNET: u16 = 13;
+}
+
+/// One IKEv2 Configuration Attribute (RFC 7296 §3.15.1): a 15-bit type (the top
+/// "reserved" bit is always clear — the TV/AF short form of IKEv1 is not used in
+/// IKEv2), a 2-byte length, then the value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigAttr {
+    pub attr_type: u16,
+    pub value: Vec<u8>,
+}
+
+impl ConfigAttr {
+    /// A 4-byte IPv4-valued attribute (address/netmask/DNS).
+    pub fn ipv4(attr_type: u16, addr: Ipv4Addr) -> Self {
+        ConfigAttr { attr_type, value: addr.octets().to_vec() }
+    }
+
+    fn write(&self, out: &mut Vec<u8>) {
+        push_u16(out, self.attr_type & 0x7fff); // top bit reserved, MUST be 0
+        push_u16(out, self.value.len() as u16);
+        out.extend_from_slice(&self.value);
+    }
+
+    fn parse(buf: &[u8]) -> Result<(ConfigAttr, usize), IkeError> {
+        if buf.len() < 4 {
+            return Err(IkeError::Truncated { need: 4, have: buf.len() });
+        }
+        let attr_type = u16be(buf, 0) & 0x7fff;
+        let len = u16be(buf, 2) as usize;
+        if 4 + len > buf.len() {
+            return Err(IkeError::BadLength { declared: 4 + len, available: buf.len() });
+        }
+        Ok((ConfigAttr { attr_type, value: buf[4..4 + len].to_vec() }, 4 + len))
+    }
+}
+
+/// A Configuration payload body — CP (payload type 47, RFC 7296 §3.15). Carries
+/// the responder's inner-IP assignment (CFG_REPLY) that a native IKEv2 client
+/// (iOS/Android/strongSwan) needs to configure its tunnel interface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Configuration {
+    pub cfg_type: u8,
+    pub attrs: Vec<ConfigAttr>,
+}
+
+impl Configuration {
+    /// A CFG_REPLY assigning the peer an inner IPv4, with optional netmask + DNS.
+    pub fn reply_ipv4(addr: Ipv4Addr, netmask: Option<Ipv4Addr>, dns: Option<Ipv4Addr>) -> Self {
+        let mut attrs = vec![ConfigAttr::ipv4(config_attr::INTERNAL_IP4_ADDRESS, addr)];
+        if let Some(m) = netmask {
+            attrs.push(ConfigAttr::ipv4(config_attr::INTERNAL_IP4_NETMASK, m));
+        }
+        if let Some(d) = dns {
+            attrs.push(ConfigAttr::ipv4(config_attr::INTERNAL_IP4_DNS, d));
+        }
+        Configuration { cfg_type: cfg_type::REPLY, attrs }
+    }
+
+    /// A CFG_REQUEST asking the responder to assign an inner IPv4 (an empty
+    /// INTERNAL_IP4_ADDRESS attribute), as a native client sends.
+    pub fn request_ipv4() -> Self {
+        Configuration {
+            cfg_type: cfg_type::REQUEST,
+            attrs: vec![ConfigAttr { attr_type: config_attr::INTERNAL_IP4_ADDRESS, value: Vec::new() }],
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(self.cfg_type);
+        out.extend_from_slice(&[0, 0, 0]); // RESERVED
+        for a in &self.attrs {
+            a.write(&mut out);
+        }
+        out
+    }
+
+    pub fn parse(body: &[u8]) -> Result<Configuration, IkeError> {
+        if body.len() < 4 {
+            return Err(IkeError::Truncated { need: 4, have: body.len() });
+        }
+        let cfg_type = body[0];
+        let mut off = 4; // skip CFG type (1) + RESERVED (3)
+        let mut attrs = Vec::new();
+        while off < body.len() {
+            let (a, consumed) = ConfigAttr::parse(&body[off..])?;
+            attrs.push(a);
+            off += consumed;
+        }
+        Ok(Configuration { cfg_type, attrs })
+    }
+
+    /// The first INTERNAL_IP4_ADDRESS attribute value, if present and well-formed.
+    pub fn assigned_ipv4(&self) -> Option<Ipv4Addr> {
+        self.attrs
+            .iter()
+            .find(|a| a.attr_type == config_attr::INTERNAL_IP4_ADDRESS && a.value.len() == 4)
+            .map(|a| Ipv4Addr::new(a.value[0], a.value[1], a.value[2], a.value[3]))
     }
 }
 

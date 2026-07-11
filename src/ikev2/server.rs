@@ -100,7 +100,7 @@ impl<E: Entropy> Server<E> {
                 let mut iv = [0u8; 8];
                 self.entropy.fill(&mut iv);
                 let (response, peer_id, peer_child_spi) =
-                    ike_auth::responder_process_auth(&sa, &data, &self.auth, child_spi, &iv)?;
+                    ike_auth::responder_process_auth(&sa, &data, &self.auth, child_spi, &iv, None)?;
                 self.transport.send_to(&response, from)?;
                 let child = ChildSa::derive(&sa.keys.sk_d, &sa.ni, &sa.nr, Role::Responder, child_spi, peer_child_spi);
                 self.children.insert(key, child);

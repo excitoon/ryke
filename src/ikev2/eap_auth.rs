@@ -23,14 +23,14 @@ use crate::ikev2::eap;
 use crate::entropy::Entropy;
 use crate::error::IkeError;
 use crate::ikev2::exchange::CompletedSaInit;
-use crate::ikev2::ike_auth::{esp_offer, initiator_eap_request};
+use crate::ikev2::ike_auth::{esp_offer, esp_spi_from_sa, initiator_eap_request, AssignedConfig};
 use crate::ikev2::message::{
     encode_payload_chain, first_payload_type, payloads, ExchangeType, Flags, IkeHeader, PayloadType,
 };
 use crate::ikev2::mschapv2;
 use crate::ikev2::payload::{
-    auth_method, sighash, Authentication, Certificate, Identification, TrafficSelector,
-    TrafficSelectors,
+    auth_method, Authentication, Certificate, Configuration, Identification,
+    TrafficSelector, TrafficSelectors,
 };
 use crate::role::Role;
 use crate::ikev2::sign::SigningKey;
@@ -309,6 +309,12 @@ pub struct EapResponder {
     auth_challenge: [u8; 16],
     nt_response: [u8; 24],
     peer_idi: Vec<u8>,
+    /// The initiator's ESP SPI (from SAi2 in msg-1), needed to derive the CHILD SA.
+    peer_child_spi: Option<u32>,
+    /// Inner-network assignment for this client's Configuration Payload (CFG_REPLY)
+    /// in the final message — so the cascade's per-client inner IP is handed out
+    /// over EAP just like the PSK path.
+    assigned: Option<AssignedConfig>,
 }
 
 impl EapResponder {
@@ -331,7 +337,21 @@ impl EapResponder {
             auth_challenge: [0u8; 16],
             nt_response: [0u8; 24],
             peer_idi: Vec::new(),
+            peer_child_spi: None,
+            assigned: None,
         }
+    }
+
+    /// Set the inner-network assignment sent in the final message's Configuration
+    /// Payload (a native client needs it to configure its tunnel interface).
+    pub fn set_assigned(&mut self, assigned: Option<AssignedConfig>) {
+        self.assigned = assigned;
+    }
+
+    /// The initiator's ESP SPI (captured from SAi2), for deriving the CHILD SA
+    /// after [`EapEvent::Established`].
+    pub fn peer_child_spi(&self) -> Option<u32> {
+        self.peer_child_spi
     }
 
     pub fn handle(&mut self, message: &[u8], entropy: &mut impl Entropy) -> Result<EapEvent, IkeError> {
@@ -340,10 +360,12 @@ impl EapResponder {
         // msg-1: IDi + SA + TS, no AUTH, no EAP → authenticate ourselves and
         // start EAP with an Identity request: SK{ IDr, [CERT,] AUTH, EAP }.
         if find(&ps, PayloadType::Eap).is_none() && find(&ps, PayloadType::Authentication).is_none() {
-            if find(&ps, PayloadType::SecurityAssociation).is_none() {
+            let Some(sai2) = find(&ps, PayloadType::SecurityAssociation) else {
                 return Ok(EapEvent::Failed);
-            }
-            // Remember the initiator's IDi verbatim — its final AUTH signs over it.
+            };
+            // Capture the initiator's ESP SPI (for the CHILD SA) and its IDi
+            // verbatim (its final AUTH signs over it).
+            self.peer_child_spi = esp_spi_from_sa(sai2);
             self.peer_idi = find(&ps, PayloadType::IdInitiator).unwrap_or(&[]).to_vec();
             let idr = self.id.to_bytes();
             let octets = responder_signed_octets(&self.sa.resp_message, &self.sa.ni, &self.sa.keys.sk_pr, &idr);
@@ -355,21 +377,20 @@ impl EapResponder {
                     inner.push((PayloadType::Authentication, auth.to_bytes()));
                 }
                 ServerAuth::Cert { key, chain } => {
-                    // RFC 7427 §4: only send a Digital Signature AUTH if the peer
-                    // advertised SIGNATURE_HASH_ALGORITHMS including a hash we use
-                    // (SHA-256). Otherwise a conformant client would reject it.
-                    if !self.sa.peer_signature_hashes.contains(&sighash::SHA2_256) {
-                        return Err(IkeError::Crypto(
-                            "peer did not offer SHA-256 for Digital Signature auth",
-                        ));
-                    }
                     // Send the chain (leaf first) unconditionally — iOS often
                     // sends no CERTREQ, so gating on one would break the default.
                     for cert in chain {
                         inner.push((PayloadType::Certificate, Certificate::x509(cert.clone()).to_bytes()));
                     }
-                    let data = key.sign_auth_data(&octets)?;
-                    inner.push((PayloadType::Authentication, Authentication { method: auth_method::DIGITAL_SIGNATURE, data }.to_bytes()));
+                    // Method 14 (RFC 7427) if the peer advertised SHA-256, else
+                    // the classic ECDSA method 9 — a native iOS EAP client sends
+                    // no SIGNATURE_HASH_ALGORITHMS, so it needs the classic form.
+                    let auth = crate::ikev2::ike_auth::cert_auth_payload(
+                        key,
+                        &self.sa.peer_signature_hashes,
+                        &octets,
+                    )?;
+                    inner.push((PayloadType::Authentication, auth.to_bytes()));
                 }
             }
             let eap = eap::EapPacket { code: eap::code::REQUEST, identifier: self.eap_id, data: vec![eap::eap_type::IDENTITY] };
@@ -393,13 +414,29 @@ impl EapResponder {
                     method: auth_method::SHARED_KEY,
                     data: psk_auth(&msk, &responder_signed_octets(&self.sa.resp_message, &self.sa.ni, &self.sa.keys.sk_pr, &idr)),
                 };
-                let msg = build_sk(&self.sa, msg_id, true, &[
+                // Assign the client its inner IP via a Configuration Payload
+                // (CFG_REPLY) and narrow TSi to that /32, mirroring the PSK path,
+                // so the cascade's per-client IP works over EAP too.
+                let mut inner: Vec<(PayloadType, Vec<u8>)> = vec![
                     (PayloadType::IdResponder, idr),
                     (PayloadType::Authentication, our_auth.to_bytes()),
-                    (PayloadType::SecurityAssociation, esp_offer(self.child_spi).to_bytes()),
-                    (PayloadType::TrafficSelectorInitiator, full_tunnel_ts()),
-                    (PayloadType::TrafficSelectorResponder, full_tunnel_ts()),
-                ], &iv(entropy))?;
+                ];
+                let tsi = match &self.assigned {
+                    Some(a) => {
+                        let dns = a.dns.first().copied();
+                        inner.push((
+                            PayloadType::Configuration,
+                            Configuration::reply_ipv4(a.ip, None, dns).to_bytes(),
+                        ));
+                        TrafficSelectors { selectors: vec![TrafficSelector::ipv4_host(a.ip)] }
+                            .to_bytes()
+                    }
+                    None => full_tunnel_ts(),
+                };
+                inner.push((PayloadType::SecurityAssociation, esp_offer(self.child_spi).to_bytes()));
+                inner.push((PayloadType::TrafficSelectorInitiator, tsi));
+                inner.push((PayloadType::TrafficSelectorResponder, full_tunnel_ts()));
+                let msg = build_sk(&self.sa, msg_id, true, &inner, &iv(entropy))?;
                 return Ok(EapEvent::Established(Some(msg)));
             }
         }
@@ -609,15 +646,20 @@ mod tests {
     }
 
     #[test]
-    fn cert_server_requires_a_peer_signature_hash_offer() {
-        // RFC 7427 §4: if the client never advertised SIGNATURE_HASH_ALGORITHMS,
-        // the cert server must not emit a method-14 AUTH.
+    fn cert_server_falls_back_to_classic_ecdsa_without_a_hash_offer() {
+        // A native EAP client (iOS) sends no SIGNATURE_HASH_ALGORITHMS. Rather
+        // than fail, the ECDSA cert server emits the classic method-9 AUTH
+        // (RFC 4754), so it still interoperates.
         let (init_sa, mut resp_sa) = sa_pair();
-        resp_sa.peer_signature_hashes.clear(); // simulate a client that offered none
+        resp_sa.peer_signature_hashes.clear(); // client offered none
         let mut responder = EapResponder::new(resp_sa, Identification::fqdn("vpn.example.com"), cert_server(), b"alice".to_vec(), "s3cret".into(), 0x2222);
         let initiator = EapInitiator::new(init_sa, Identification::fqdn("alice"), b"alice".to_vec(), "s3cret".into(), 0x1111, trust(vec![CA_CERT_DER.to_vec()]));
         let msg1 = initiator.start(&mut SeedEntropy::new(1)).unwrap();
-        assert!(responder.handle(&msg1, &mut SeedEntropy::new(2)).is_err());
+        // The responder now produces a reply (its cert + a method-9 AUTH), not an error.
+        assert!(matches!(
+            responder.handle(&msg1, &mut SeedEntropy::new(2)),
+            Ok(EapEvent::Reply(_))
+        ));
     }
 
     #[test]

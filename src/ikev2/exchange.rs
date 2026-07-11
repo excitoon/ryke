@@ -19,6 +19,9 @@ use crate::error::IkeError;
 use crate::ikev2::message::{
     payloads, ExchangeType, Flags, IkeHeader, MessageBuilder, PayloadType,
 };
+use sha2::{Digest, Sha256};
+
+use crate::ikev2::natt;
 use crate::ikev2::negotiate::{self, ChosenSuite};
 use crate::ikev2::payload::{
     notify_type, protocol_id, sighash, transform_id, transform_type, KeyExchange, Nonce, Notify,
@@ -106,6 +109,8 @@ struct SaInitPayloads {
     nonce: Nonce,
     /// The peer's advertised RFC 7427 signature hashes (empty if it sent none).
     signature_hashes: Vec<u16>,
+    /// A COOKIE notify the initiator echoed back (RFC 7296 §2.6), if any.
+    cookie: Option<Vec<u8>>,
 }
 
 /// Decode a `SIGNATURE_HASH_ALGORITHMS` notify's data — a bare list of 16-bit
@@ -119,6 +124,7 @@ fn parse_sa_init(header: &IkeHeader, body: &[u8]) -> Result<SaInitPayloads, IkeE
     let mut ke = None;
     let mut nonce = None;
     let mut signature_hashes = Vec::new();
+    let mut cookie = None;
     for payload in payloads(header.next_payload, body) {
         let payload = payload?;
         match payload.payload_type {
@@ -129,6 +135,8 @@ fn parse_sa_init(header: &IkeHeader, body: &[u8]) -> Result<SaInitPayloads, IkeE
                 if let Ok(n) = Notify::parse(payload.data) {
                     if n.notify_type == notify_type::SIGNATURE_HASH_ALGORITHMS {
                         signature_hashes = parse_signature_hashes(&n.data);
+                    } else if n.notify_type == notify_type::COOKIE {
+                        cookie = Some(n.data);
                     }
                 }
             }
@@ -141,6 +149,7 @@ fn parse_sa_init(header: &IkeHeader, body: &[u8]) -> Result<SaInitPayloads, IkeE
         ke: ke.ok_or(IkeError::MissingPayload("KE"))?,
         nonce: nonce.ok_or(IkeError::MissingPayload("Nonce"))?,
         signature_hashes,
+        cookie,
     })
 }
 
@@ -168,14 +177,17 @@ fn base_header(spi_i: u64, spi_r: u64, flags: Flags) -> IkeHeader {
     }
 }
 
-fn build_sa_init(header: IkeHeader, sa: &SecurityAssociation, dh_group: u16, dh_public: &[u8], nonce: &[u8]) -> Vec<u8> {
+fn build_sa_init(header: IkeHeader, sa: &SecurityAssociation, dh_group: u16, dh_public: &[u8], nonce: &[u8], extra_notifies: &[Notify]) -> Vec<u8> {
     let ke = KeyExchange { dh_group, data: dh_public.to_vec() };
-    MessageBuilder::new(header)
+    let mut b = MessageBuilder::new(header)
         .push(PayloadType::SecurityAssociation, sa.to_bytes())
         .push(PayloadType::KeyExchange, ke.to_bytes())
         .push(PayloadType::Nonce, Nonce { data: nonce.to_vec() }.to_bytes())
-        .push(PayloadType::Notify, sighash_notify().to_bytes())
-        .build()
+        .push(PayloadType::Notify, sighash_notify().to_bytes());
+    for n in extra_notifies {
+        b = b.push(PayloadType::Notify, n.to_bytes());
+    }
+    b.build()
 }
 
 /// The peer's public value, checked against the negotiated group's ID + length.
@@ -204,17 +216,141 @@ pub fn initiator_request(local: &LocalSecret, offer: &SecurityAssociation) -> Ve
     let group = offer_dh_group(offer);
     let public = group.public(&local.dh_private);
     let header = base_header(local.spi, 0, Flags { initiator: true, version: false, response: false });
-    build_sa_init(header, offer, group.transform_id(), &public, &local.nonce)
+    build_sa_init(header, offer, group.transform_id(), &public, &local.nonce, &[])
+}
+
+/// A COOKIE challenge policy (RFC 7296 §2.6) — return-routability against
+/// spoofed-source `IKE_SA_INIT` floods. When `required`, the responder answers a
+/// request lacking the matching cookie with a COOKIE notify only (no Diffie-
+/// Hellman, no half-open state), so an attacker who can't receive at the claimed
+/// source address can never make it do work.
+pub struct CookiePolicy<'a> {
+    /// A responder-private secret, rotated periodically.
+    pub secret: &'a [u8],
+    /// The observed source address of the request (its bytes), bound into the
+    /// cookie so a cookie is only valid from the address it was issued to.
+    pub peer: &'a [u8],
+    /// Whether to demand a cookie right now (e.g. when half-open SAs are high).
+    pub required: bool,
+}
+
+/// The IKEv2 COOKIE value: `SHA-256(secret | SPIi | Ni | peer_addr)`.
+pub fn ike_cookie(secret: &[u8], spi_i: u64, ni: &[u8], peer: &[u8]) -> Vec<u8> {
+    let mut h = Sha256::new();
+    h.update(secret);
+    h.update(spi_i.to_be_bytes());
+    h.update(ni);
+    h.update(peer);
+    h.finalize().to_vec()
+}
+
+/// A bare `IKE_SA_INIT` response carrying only a COOKIE notify.
+fn build_cookie_challenge(spi_i: u64, cookie: &[u8]) -> Vec<u8> {
+    let header = base_header(spi_i, 0, Flags { initiator: false, version: false, response: true });
+    let notify = Notify::status(notify_type::COOKIE, cookie.to_vec());
+    MessageBuilder::new(header).push(PayloadType::Notify, notify.to_bytes()).build()
+}
+
+/// The outcome of responding to an `IKE_SA_INIT` request.
+// Short-lived: returned and immediately matched by the caller, so the size gap
+// between variants costs nothing — boxing would only add a pointless allocation.
+#[allow(clippy::large_enum_variant)]
+pub enum SaInitResult {
+    /// The SA is half-open: send `response` and keep `sa` awaiting `IKE_AUTH`.
+    Established { response: Vec<u8>, sa: CompletedSaInit },
+    /// The initiator's Key Exchange payload was for a Diffie-Hellman group we did
+    /// not select; send `response` (an `INVALID_KE_PAYLOAD` notify naming `group`)
+    /// and keep NO state — the initiator resends `IKE_SA_INIT` with the right KE
+    /// (RFC 7296 §1.2 / §2.7). Native clients (iOS/Android) rely on this.
+    InvalidKe { response: Vec<u8>, group: u16 },
+    /// A cookie is required (anti-DoS): send `response` (a COOKIE notify) and keep
+    /// NO state; the initiator resends `IKE_SA_INIT` echoing the cookie.
+    CookieRequired { response: Vec<u8> },
 }
 
 /// Responder: consume the request, choose a suite, derive keys, and build the
 /// response. Returns the response bytes and our completed state.
 pub fn responder_respond(request: &[u8], local: &LocalSecret) -> Result<(Vec<u8>, CompletedSaInit), IkeError> {
+    match responder_respond_inner(request, local, None, None)? {
+        SaInitResult::Established { response, sa } => Ok((response, sa)),
+        // Unreachable for the non-NAT path: it returns DhGroupMismatch instead,
+        // and never requests a cookie (no policy passed).
+        SaInitResult::InvalidKe { group, .. } => {
+            Err(IkeError::DhGroupMismatch { expected: group, got: group })
+        }
+        SaInitResult::CookieRequired { .. } => Err(IkeError::NoProposalChosen),
+    }
+}
+
+/// SA_INIT responder **with NAT traversal + DH-group renegotiation**: like
+/// [`responder_respond`], but also emits `NAT_DETECTION_SOURCE_IP` /
+/// `NAT_DETECTION_DESTINATION_IP` notifies so a native (NAT'd) client detects the
+/// NAT and floats IKE + ESP to UDP 4500 (RFC 7296 §2.23), and returns an
+/// [`SaInitResult::InvalidKe`] (rather than erroring) when the client guessed the
+/// wrong DH group, so it can retry. `our_addr` is our address as the peer reaches
+/// us; `peer_addr` is the address we observed the request coming from.
+pub fn responder_respond_natt(
+    request: &[u8],
+    local: &LocalSecret,
+    our_addr: std::net::SocketAddr,
+    peer_addr: std::net::SocketAddr,
+    cookie: Option<CookiePolicy>,
+) -> Result<SaInitResult, IkeError> {
+    responder_respond_inner(request, local, Some((our_addr, peer_addr)), cookie)
+}
+
+/// Build a bare `IKE_SA_INIT` response carrying only an `INVALID_KE_PAYLOAD`
+/// notify naming the DH group we want the initiator to use.
+fn build_invalid_ke(spi_i: u64, group: u16) -> Vec<u8> {
+    let header = base_header(spi_i, 0, Flags { initiator: false, version: false, response: true });
+    let notify = Notify::status(notify_type::INVALID_KE_PAYLOAD, group.to_be_bytes().to_vec());
+    MessageBuilder::new(header).push(PayloadType::Notify, notify.to_bytes()).build()
+}
+
+fn responder_respond_inner(
+    request: &[u8],
+    local: &LocalSecret,
+    natt: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
+    cookie: Option<CookiePolicy>,
+) -> Result<SaInitResult, IkeError> {
     let header = IkeHeader::parse(request)?;
     let payloads = parse_sa_init(&header, &request[IkeHeader::LEN..])?;
 
+    // Anti-DoS cookie check (RFC 7296 §2.6), BEFORE any Diffie-Hellman: a spoofed
+    // source that can't receive the challenge never makes us do the expensive DH
+    // or hold half-open state.
+    if let Some(pol) = &cookie {
+        if pol.required {
+            let expected = ike_cookie(pol.secret, header.initiator_spi, &payloads.nonce.data, pol.peer);
+            if payloads.cookie.as_deref() != Some(expected.as_slice()) {
+                return Ok(SaInitResult::CookieRequired {
+                    response: build_cookie_challenge(header.initiator_spi, &expected),
+                });
+            }
+        }
+    }
+
     let suite = negotiate::select(&payloads.sa).ok_or(IkeError::NoProposalChosen)?;
     let group = DhGroup::from_transform_id(suite.dh_id).ok_or(IkeError::NoProposalChosen)?;
+
+    // The initiator sends a KE payload for its best-guess group; if we selected a
+    // different one (it offered several, we support a different subset), tell it
+    // to retry with ours. Real clients propose e.g. ECP groups we don't have and
+    // fall back to MODP-2048 only when asked.
+    if payloads.ke.dh_group != group.transform_id() {
+        match natt {
+            Some(_) => {
+                let response = build_invalid_ke(header.initiator_spi, group.transform_id());
+                return Ok(SaInitResult::InvalidKe { response, group: group.transform_id() });
+            }
+            None => {
+                return Err(IkeError::DhGroupMismatch {
+                    expected: group.transform_id(),
+                    got: payloads.ke.dh_group,
+                })
+            }
+        }
+    }
     let peer_public = dh_peer(&payloads.ke, group)?;
 
     let our_public = group.public(&local.dh_private);
@@ -231,9 +367,19 @@ pub fn responder_respond(request: &[u8], local: &LocalSecret) -> Result<(Vec<u8>
         suite.key_lengths(),
     );
 
+    // NAT-detection notifies (RFC 7296 §2.23): SOURCE = hash of our own address,
+    // DESTINATION = hash of the peer's address as we observed it. A client behind
+    // NAT sees the DESTINATION hash disagree with its local address and floats to
+    // UDP 4500.
+    let mut extra_notifies = Vec::new();
+    if let Some((our_addr, peer_addr)) = natt {
+        extra_notifies.push(natt::source_ip_notify(spi_i, spi_r, our_addr.ip(), our_addr.port()));
+        extra_notifies.push(natt::destination_ip_notify(spi_i, spi_r, peer_addr.ip(), peer_addr.port()));
+    }
+
     let response_header = base_header(spi_i, spi_r, Flags { initiator: false, version: false, response: true });
     let sar1 = SecurityAssociation { proposals: vec![suite.to_proposal()] };
-    let response = build_sa_init(response_header, &sar1, suite.dh_id, &our_public, &local.nonce);
+    let response = build_sa_init(response_header, &sar1, suite.dh_id, &our_public, &local.nonce, &extra_notifies);
 
     let completed = CompletedSaInit {
         role: Role::Responder,
@@ -247,7 +393,7 @@ pub fn responder_respond(request: &[u8], local: &LocalSecret) -> Result<(Vec<u8>
         resp_message: response.clone(),
         peer_signature_hashes: payloads.signature_hashes,
     };
-    Ok((response, completed))
+    Ok(SaInitResult::Established { response, sa: completed })
 }
 
 /// Initiator step 2: consume the response and derive keys. `request` is the
@@ -332,6 +478,75 @@ mod tests {
         let init_done = initiator_complete(&init_secret(), &request, &response).unwrap();
         assert!(resp_done.peer_signature_hashes.contains(&sighash::SHA2_256));
         assert!(init_done.peer_signature_hashes.contains(&sighash::SHA2_256));
+    }
+
+    #[test]
+    fn responder_natt_emits_nat_detection_and_still_completes() {
+        let request = initiator_request(&init_secret(), &default_offer());
+        let our: std::net::SocketAddr = "203.0.113.9:500".parse().unwrap();
+        let peer: std::net::SocketAddr = "198.51.100.7:41234".parse().unwrap();
+        let response = match responder_respond_natt(&request, &resp_secret(), our, peer, None).unwrap() {
+            SaInitResult::Established { response, .. } => response,
+            SaInitResult::InvalidKe { .. } => panic!("matching DH group must establish, not renegotiate"),
+            SaInitResult::CookieRequired { .. } => panic!("no cookie policy was passed"),
+        };
+
+        // An initiator still parses the response — the extra notifies are tolerated.
+        let init_done = initiator_complete(&init_secret(), &request, &response).unwrap();
+        assert_eq!(init_done.role, Role::Initiator);
+
+        // Both NAT_DETECTION notifies are present so a NAT'd client floats to 4500.
+        let hdr = crate::ikev2::message::IkeHeader::parse(&response).unwrap();
+        let mut kinds = Vec::new();
+        for p in crate::ikev2::message::payloads(hdr.next_payload, &response[crate::ikev2::message::IkeHeader::LEN..]) {
+            let p = p.unwrap();
+            if p.payload_type == crate::ikev2::message::PayloadType::Notify {
+                kinds.push(Notify::parse(p.data).unwrap().notify_type);
+            }
+        }
+        assert!(kinds.contains(&notify_type::NAT_DETECTION_SOURCE_IP));
+        assert!(kinds.contains(&notify_type::NAT_DETECTION_DESTINATION_IP));
+
+        // The plain (non-NAT-T) responder emits neither.
+        let (plain, _) = responder_respond(&request, &resp_secret()).unwrap();
+        let phdr = crate::ikev2::message::IkeHeader::parse(&plain).unwrap();
+        for p in crate::ikev2::message::payloads(phdr.next_payload, &plain[crate::ikev2::message::IkeHeader::LEN..]) {
+            let p = p.unwrap();
+            if p.payload_type == crate::ikev2::message::PayloadType::Notify {
+                let nt = Notify::parse(p.data).unwrap().notify_type;
+                assert_ne!(nt, notify_type::NAT_DETECTION_SOURCE_IP);
+                assert_ne!(nt, notify_type::NAT_DETECTION_DESTINATION_IP);
+            }
+        }
+    }
+
+    #[test]
+    fn cookie_gate_challenges_when_required_and_passes_when_not() {
+        let request = initiator_request(&init_secret(), &default_offer());
+        let our: std::net::SocketAddr = "203.0.113.9:500".parse().unwrap();
+        let peer: std::net::SocketAddr = "198.51.100.7:1234".parse().unwrap();
+        let peer_ip = match peer.ip() {
+            std::net::IpAddr::V4(a) => a.octets().to_vec(),
+            _ => unreachable!(),
+        };
+
+        // Required + no cookie echoed → a COOKIE challenge (no DH, no state).
+        let pol = CookiePolicy { secret: b"s3cret", peer: &peer_ip, required: true };
+        assert!(matches!(
+            responder_respond_natt(&request, &resp_secret(), our, peer, Some(pol)).unwrap(),
+            SaInitResult::CookieRequired { .. }
+        ));
+        // A cookie from a different secret/peer must NOT be accepted as valid —
+        // still challenged (the check is against ike_cookie of THIS secret+peer).
+        let other = ike_cookie(b"other", 1, b"ni", b"1.2.3.4");
+        assert_ne!(other, ike_cookie(b"s3cret", 1, b"ni", &peer_ip));
+
+        // Not required → normal establishment (gate is off under low load).
+        let pol2 = CookiePolicy { secret: b"s3cret", peer: &peer_ip, required: false };
+        assert!(matches!(
+            responder_respond_natt(&request, &resp_secret(), our, peer, Some(pol2)).unwrap(),
+            SaInitResult::Established { .. }
+        ));
     }
 
     /// The core M1 property: run initiator ↔ responder in-process and confirm

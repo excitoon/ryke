@@ -102,6 +102,15 @@ pub enum SigningKey {
 }
 
 impl SigningKey {
+    /// Load an ECDSA P-256 signing key from a PKCS#8 DER document — the form a
+    /// server certificate's private key is generated in (`openssl pkcs8 …`).
+    pub fn ecdsa_p256_from_pkcs8_der(der: &[u8]) -> Result<Self, IkeError> {
+        use p256::pkcs8::DecodePrivateKey;
+        let key = p256::ecdsa::SigningKey::from_pkcs8_der(der)
+            .map_err(|_| IkeError::Crypto("bad EC PKCS#8 DER private key"))?;
+        Ok(SigningKey::EcdsaP256(key))
+    }
+
     /// The DER `AlgorithmIdentifier` this key advertises in the AUTH payload.
     pub fn algorithm_id(&self) -> &'static [u8] {
         match self {
@@ -128,6 +137,24 @@ impl SigningKey {
             }
         };
         Ok(wrap_auth_data(self.algorithm_id(), &sig))
+    }
+
+    /// Sign as the classic IKEv2 method-9 AUTH (ECDSA-256, RFC 4754): the raw
+    /// `r || s` (64 bytes for P-256) over `SHA-256(octets)`, with no RFC 7427
+    /// algorithm wrapper. Used when the peer does not negotiate Digital
+    /// Signature (a native EAP client that sends no SIGNATURE_HASH_ALGORITHMS).
+    pub fn sign_ecdsa_p256_raw(&self, signed_octets: &[u8]) -> Result<Vec<u8>, IkeError> {
+        match self {
+            SigningKey::EcdsaP256(key) => {
+                use p256::ecdsa::signature::hazmat::PrehashSigner;
+                let digest = Sha256::digest(signed_octets);
+                let sig: p256::ecdsa::Signature = key
+                    .sign_prehash(&digest)
+                    .map_err(|_| IkeError::Crypto("ECDSA signing failed"))?;
+                Ok(sig.to_bytes().to_vec())
+            }
+            SigningKey::RsaSha256(_) => Err(IkeError::Crypto("method 9 needs an ECDSA P-256 key")),
+        }
     }
 }
 

@@ -49,17 +49,21 @@ pub use crypto::{
     derive_child_keys, derive_session_keys, prf, prf_plus, ChildKeys, DhGroup, KeyLengths,
     SessionKeys,
 };
-pub use ikev2::eap_auth::{EapEvent, EapInitiator, EapResponder};
+pub use ikev2::eap_auth::{EapEvent, EapInitiator, EapResponder, ServerAuth, ServerVerify};
 pub use entropy::{Entropy, SeedEntropy};
 pub use error::IkeError;
 pub use esp::{ChildSa, EspSa};
 pub use ikev2::exchange::{
-    default_offer, initiator_complete, initiator_request, responder_respond, CompletedSaInit,
-    LocalSecret,
+    default_offer, ike_cookie, initiator_complete, initiator_request, responder_respond,
+    responder_respond_natt, CompletedSaInit, CookiePolicy, LocalSecret, SaInitResult,
+};
+pub use ikev2::natt::{
+    is_ike_on_4500, unwrap_ike_4500, wrap_ike_4500, NON_ESP_MARKER,
 };
 pub use ikev2::ike_auth::{
     esp_offer, initiator_auth_request, initiator_eap_request, initiator_verify_auth,
-    responder_process_auth, AuthConfig, LocalAuth, PeerAuth,
+    is_eap_request, peer_id_from_auth, responder_process_auth, AssignedConfig, AuthConfig,
+    LocalAuth, PeerAuth,
 };
 pub use ikev2::message::{
     payloads, ExchangeType, Flags, IkeHeader, MessageBuilder, PayloadIter, PayloadType, RawPayload,
@@ -67,8 +71,9 @@ pub use ikev2::message::{
 pub use ikev2::negotiate::ChosenSuite;
 pub use ikev2::auth::{initiator_signed_octets, psk_auth, responder_signed_octets};
 pub use ikev2::payload::{
-    Authentication, CertRequest, Certificate, Delete, Identification, KeyExchange, Nonce, Notify,
-    Proposal, SecurityAssociation, TrafficSelector, TrafficSelectors, Transform,
+    cfg_type, config_attr, notify_type, Authentication, CertRequest, Certificate, ConfigAttr,
+    Configuration, Delete, Identification, KeyExchange, Nonce, Notify, Proposal,
+    SecurityAssociation, TrafficSelector, TrafficSelectors, Transform,
 };
 pub use ikev2::sign::{SigningKey, VerifyingKey};
 pub use role::Role;

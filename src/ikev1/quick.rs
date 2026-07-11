@@ -43,7 +43,7 @@ mod esp_attr {
 const ENCAP_TUNNEL: u16 = 1;
 const LIFE_SECONDS: u16 = 1;
 
-fn find<'a>(ps: &'a [Payload], t: u8) -> Option<&'a Payload> {
+fn find(ps: &[Payload], t: u8) -> Option<&Payload> {
     ps.iter().find(|p| p.payload_type == t)
 }
 

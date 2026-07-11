@@ -1,7 +1,7 @@
 //! A minimal blocking IKEv2 **initiator** (client) over UDP.
 
 use std::io;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use crate::entropy::Entropy;
@@ -45,14 +45,15 @@ impl<E: Entropy> Client<E> {
     }
 
     /// After a completed SA_INIT, run `IKE_AUTH` (PSK) against `server`. Returns
-    /// the peer's verified identity and the responder's chosen CHILD SA SPI.
+    /// the peer's verified identity, the responder's chosen CHILD SA SPI, and the
+    /// inner IPv4 the responder assigned via its Configuration Payload (if any).
     pub fn authenticate(
         &mut self,
         server: SocketAddr,
         sa: &CompletedSaInit,
         cfg: &AuthConfig,
         child_spi: u32,
-    ) -> Result<(Identification, u32), DriverError> {
+    ) -> Result<(Identification, u32, Option<Ipv4Addr>), DriverError> {
         let mut iv = [0u8; 8];
         self.entropy.fill(&mut iv);
         let request = ike_auth::initiator_auth_request(sa, cfg, child_spi, &iv)?;
@@ -62,17 +63,18 @@ impl<E: Entropy> Client<E> {
     }
 
     /// Full handshake: `IKE_SA_INIT` then `IKE_AUTH`. Returns the established IKE
-    /// SA, the peer's verified identity, and the ESP CHILD SA (data-plane keys)
-    /// derived for the given `child_spi`.
+    /// SA, the peer's verified identity, the ESP CHILD SA (data-plane keys)
+    /// derived for the given `child_spi`, and the responder-assigned inner IPv4
+    /// (from its Configuration Payload) if one was provided.
     pub fn connect(
         &mut self,
         server: SocketAddr,
         cfg: &AuthConfig,
         child_spi: u32,
-    ) -> Result<(CompletedSaInit, Identification, ChildSa), DriverError> {
+    ) -> Result<(CompletedSaInit, Identification, ChildSa, Option<Ipv4Addr>), DriverError> {
         let sa = self.sa_init(server)?;
-        let (peer, peer_child_spi) = self.authenticate(server, &sa, cfg, child_spi)?;
+        let (peer, peer_child_spi, assigned_ip) = self.authenticate(server, &sa, cfg, child_spi)?;
         let child = ChildSa::derive(&sa.keys.sk_d, &sa.ni, &sa.nr, Role::Initiator, child_spi, peer_child_spi);
-        Ok((sa, peer, child))
+        Ok((sa, peer, child, assigned_ip))
     }
 }
