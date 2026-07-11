@@ -124,6 +124,15 @@ client (initiator) and server (responder)** roles.
   detection). Socket rebinding on a move is left to the consumer.
 - **M6 — device interop:** iPhone, then Android (the long tail).
 
+## Experimental — IKEv3 draft
+
+Separate from the IKEv2 roadmap above: an experimental implementation of
+`draft-harkins-ikev3` (the unratified "IKEv3") is planned in an `ikev3draft`
+module — signature auth first, Dragonfly PSK deferred/experimental. It has **no
+deployed peers to interop against** and is a completeness/research exercise, not
+a shipping feature. Full design + decision record:
+[`docs/ikev3draft.md`](ikev3draft.md).
+
 ## Testing
 
 - Offline unit tests with byte vectors and RFC known-answer tests (in place).
