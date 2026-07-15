@@ -18,12 +18,17 @@
 //! EAP-derived MSK. This whole sequence is interop-validated against an
 //! independent IKEv2 responder.
 
+use std::collections::HashMap;
+
 use crate::ikev2::auth::{initiator_signed_octets, psk_auth, responder_signed_octets};
 use crate::ikev2::eap;
 use crate::entropy::Entropy;
 use crate::error::IkeError;
 use crate::ikev2::exchange::CompletedSaInit;
-use crate::ikev2::ike_auth::{esp_offer, esp_spi_from_sa, initiator_eap_request, AssignedConfig};
+use crate::ikev2::ike_auth::{
+    esp_offer, esp_spi_from_sa, initiator_eap_request, initiator_eap_request_with_certreq,
+    AssignedConfig,
+};
 use crate::ikev2::message::{
     encode_payload_chain, first_payload_type, payloads, ExchangeType, Flags, IkeHeader, PayloadType,
 };
@@ -146,6 +151,7 @@ pub struct EapInitiator {
     nt_response: [u8; 24],
     verify: ServerVerify,
     server_verified: bool,
+    send_certreq: bool,
 }
 
 impl EapInitiator {
@@ -166,7 +172,14 @@ impl EapInitiator {
             nt_response: [0u8; 24],
             verify,
             server_verified: false,
+            send_certreq: false,
         }
+    }
+
+    /// Include a `CERTREQ` in the first message (mirrors a strongSwan client) —
+    /// used to exercise a responder's CERTREQ-based cert selection.
+    pub fn set_send_certreq(&mut self, on: bool) {
+        self.send_certreq = on;
     }
 
     /// Authenticate the server from its first response (`SK{ IDr, [CERT,] AUTH,
@@ -204,7 +217,17 @@ impl EapInitiator {
 
     /// First message: `SK{ IDi, SAi2, TSi, TSr }` (no AUTH — request EAP).
     pub fn start(&self, entropy: &mut impl Entropy) -> Result<Vec<u8>, IkeError> {
-        initiator_eap_request(&self.sa, &self.id, self.child_spi, &iv(entropy))
+        if self.send_certreq {
+            initiator_eap_request_with_certreq(
+                &self.sa,
+                &self.id,
+                self.child_spi,
+                vec![[0u8; 20]],
+                &iv(entropy),
+            )
+        } else {
+            initiator_eap_request(&self.sa, &self.id, self.child_spi, &iv(entropy))
+        }
     }
 
     /// Process a responder message and produce the next step.
@@ -304,6 +327,9 @@ pub struct EapResponder {
     auth: ServerAuth,
     user: Vec<u8>,
     password: String,
+    /// All accepted credentials (username → password). The client's claimed EAP
+    /// identity selects one at the Identity step; an unknown identity is rejected.
+    users: HashMap<Vec<u8>, String>,
     child_spi: u32,
     eap_id: u8,
     auth_challenge: [u8; 16],
@@ -326,12 +352,26 @@ impl EapResponder {
         password: String,
         child_spi: u32,
     ) -> Self {
+        let users = HashMap::from([(user, password)]);
+        Self::new_multi(sa, id, auth, users, child_spi)
+    }
+
+    /// Like [`new`](Self::new) but accepts multiple credentials; the client's EAP
+    /// identity picks which password to verify against (an unknown one fails).
+    pub fn new_multi(
+        sa: CompletedSaInit,
+        id: Identification,
+        auth: ServerAuth,
+        users: HashMap<Vec<u8>, String>,
+        child_spi: u32,
+    ) -> Self {
         EapResponder {
             sa,
             id,
             auth,
-            user,
-            password,
+            user: Vec::new(),
+            password: String::new(),
+            users,
             child_spi,
             eap_id: 1,
             auth_challenge: [0u8; 16],
@@ -352,6 +392,12 @@ impl EapResponder {
     /// after [`EapEvent::Established`].
     pub fn peer_child_spi(&self) -> Option<u32> {
         self.peer_child_spi
+    }
+
+    /// The credential (username) selected by the client's EAP identity. Empty
+    /// until the Identity step has run; meaningful once authentication succeeds.
+    pub fn user(&self) -> &[u8] {
+        &self.user
     }
 
     pub fn handle(&mut self, message: &[u8], entropy: &mut impl Entropy) -> Result<EapEvent, IkeError> {
@@ -436,6 +482,13 @@ impl EapResponder {
                 inner.push((PayloadType::SecurityAssociation, esp_offer(self.child_spi).to_bytes()));
                 inner.push((PayloadType::TrafficSelectorInitiator, tsi));
                 inner.push((PayloadType::TrafficSelectorResponder, full_tunnel_ts()));
+                // Advertise MOBIKE so the client migrates the SA across network
+                // changes (Wi-Fi↔cellular / NAT rebind) via UPDATE_SA_ADDRESSES
+                // instead of tearing the tunnel down and reconnecting.
+                inner.push((
+                    PayloadType::Notify,
+                    crate::ikev2::mobike::mobike_supported().to_bytes(),
+                ));
                 let msg = build_sk(&self.sa, msg_id, true, &inner, &iv(entropy))?;
                 return Ok(EapEvent::Established(Some(msg)));
             }
@@ -448,6 +501,16 @@ impl EapResponder {
 
         let out = match eap.eap_type() {
             Some(t) if t == eap::eap_type::IDENTITY => {
+                // The claimed identity selects this client's credentials; an
+                // unknown username is rejected here, before any challenge.
+                let claimed = eap.data.get(1..).unwrap_or(&[]).to_vec();
+                match self.users.get(&claimed) {
+                    Some(pw) => {
+                        self.user = claimed;
+                        self.password = pw.clone();
+                    }
+                    None => return Ok(EapEvent::Failed),
+                }
                 // Got the identity → send an MSCHAPv2 Challenge.
                 entropy.fill(&mut self.auth_challenge);
                 eap::build_challenge(1, &self.auth_challenge, b"ryke")
@@ -566,6 +629,29 @@ mod tests {
         let initiator = EapInitiator::new(init_sa, Identification::fqdn("alice"), b"alice".to_vec(), "s3cret".into(), 0x1111, trust(vec![CA_CERT_DER.to_vec()]));
         let responder = EapResponder::new(resp_sa, Identification::fqdn("vpn.example.com"), cert_server(), b"alice".to_vec(), "s3cret".into(), 0x2222);
         assert_eq!(drive(initiator, responder), Outcome::Established);
+    }
+
+    #[test]
+    fn multi_user_selects_password_by_identity() {
+        // Two provisioned users; a client authenticating as the *second* must
+        // succeed — proving credentials are keyed by the client's EAP identity.
+        let (init_sa, resp_sa) = sa_pair();
+        let users = HashMap::from([
+            (b"alice".to_vec(), "alice-pw".to_string()),
+            (b"bob".to_vec(), "bob-pw".to_string()),
+        ]);
+        let initiator = EapInitiator::new(init_sa, Identification::fqdn("bob"), b"bob".to_vec(), "bob-pw".into(), 0x1111, ServerVerify::Insecure);
+        let responder = EapResponder::new_multi(resp_sa, Identification::fqdn("gw"), ServerAuth::Psk(b"psk".to_vec()), users, 0x2222);
+        assert_eq!(drive(initiator, responder), Outcome::Established);
+    }
+
+    #[test]
+    fn multi_user_rejects_unknown_identity() {
+        let (init_sa, resp_sa) = sa_pair();
+        let users = HashMap::from([(b"alice".to_vec(), "alice-pw".to_string())]);
+        let initiator = EapInitiator::new(init_sa, Identification::fqdn("mallory"), b"mallory".to_vec(), "whatever".into(), 0x1111, ServerVerify::Insecure);
+        let responder = EapResponder::new_multi(resp_sa, Identification::fqdn("gw"), ServerAuth::Psk(b"psk".to_vec()), users, 0x2222);
+        assert_eq!(drive(initiator, responder), Outcome::Failed, "an unprovisioned identity must fail");
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub mod natt;
 pub mod fragment;
 pub mod informational;
 pub mod rekey;
+pub mod ike_rekey;
 pub mod mobike;
 pub mod client;
 pub mod server;

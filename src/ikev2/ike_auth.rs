@@ -317,6 +317,28 @@ pub fn initiator_eap_request(
     build_encrypted_gcm(ike_auth_header(sa, false), first, &inner_bytes, &sa.keys.sk_ei, iv)
 }
 
+/// Like [`initiator_eap_request`] but also carries a `CERTREQ` payload listing
+/// `ca_hashes` — mirrors a strongSwan client that advertises the CAs it trusts.
+/// Lets a responder that selects its cert by CERTREQ presence be exercised.
+pub fn initiator_eap_request_with_certreq(
+    sa: &CompletedSaInit,
+    id: &Identification,
+    child_spi: u32,
+    ca_hashes: Vec<[u8; 20]>,
+    iv: &[u8; 8],
+) -> Result<Vec<u8>, IkeError> {
+    let inner = vec![
+        (PayloadType::IdInitiator, id.to_bytes()),
+        (PayloadType::SecurityAssociation, esp_offer(child_spi).to_bytes()),
+        (PayloadType::TrafficSelectorInitiator, full_tunnel_ts()),
+        (PayloadType::TrafficSelectorResponder, full_tunnel_ts()),
+        (PayloadType::CertRequest, CertRequest::x509(ca_hashes).to_bytes()),
+    ];
+    let first = first_payload_type(&inner);
+    let inner_bytes = encode_payload_chain(&inner);
+    build_encrypted_gcm(ike_auth_header(sa, false), first, &inner_bytes, &sa.keys.sk_ei, iv)
+}
+
 /// Responder: decrypt + verify the initiator's `IKE_AUTH` request, then build
 /// the encrypted response `SK { IDr, AUTH, SAr2, TSi, TSr }`. Returns the
 /// response bytes and the initiator's verified identity.
@@ -361,6 +383,9 @@ pub fn responder_process_auth(
     inner_out.push((PayloadType::SecurityAssociation, esp_offer(child_spi).to_bytes()));
     inner_out.push((PayloadType::TrafficSelectorInitiator, tsi));
     inner_out.push((PayloadType::TrafficSelectorResponder, full_tunnel_ts()));
+    // Advertise MOBIKE so the client migrates the SA across network changes instead
+    // of reconnecting (RFC 4555).
+    inner_out.push((PayloadType::Notify, crate::ikev2::mobike::mobike_supported().to_bytes()));
     let first_out = first_payload_type(&inner_out);
     let inner_bytes = encode_payload_chain(&inner_out);
     let response = build_encrypted_gcm(ike_auth_header(sa, true), first_out, &inner_bytes, &sa.keys.sk_er, iv)?;
@@ -378,6 +403,18 @@ pub fn peer_id_from_auth(sa: &CompletedSaInit, request: &[u8]) -> Result<Identif
     Identification::parse(&got.id_body)
 }
 
+/// The initiator's identity (`IDi`) from an `IKE_AUTH` request, whether or not it
+/// carries an AUTH payload. An EAP first message has an ID but no AUTH, so
+/// [`peer_id_from_auth`] (which requires AUTH) can't read it — this extracts the
+/// `IDi` directly. Returns `None` if the message can't be opened or has no ID.
+pub fn peer_id_from_request(sa: &CompletedSaInit, request: &[u8]) -> Option<Identification> {
+    let (first, inner) = open_encrypted_gcm(request, &sa.keys.sk_ei).ok()?;
+    let idi = payloads(first, &inner)
+        .flatten()
+        .find(|p| p.payload_type == PayloadType::IdInitiator)?;
+    Identification::parse(idi.data).ok()
+}
+
 /// Whether an `IKE_AUTH` request is the first message of an **EAP** exchange —
 /// i.e. it carries no `AUTH` payload (the initiator is saying "I'll authenticate
 /// with EAP", RFC 7296 §2.16). A PSK/cert client always includes `AUTH`.
@@ -389,6 +426,19 @@ pub fn is_eap_request(sa: &CompletedSaInit, request: &[u8]) -> bool {
         .flatten()
         .any(|p| p.payload_type == PayloadType::Authentication);
     !has_auth
+}
+
+/// Whether the client's `IKE_AUTH` carries a `CERTREQ` payload. strongSwan sends
+/// one (listing the CAs it trusts); native iOS/Android clients typically send
+/// none. A responder can use this to keep a CERTREQ client on its existing cert
+/// while serving native (no-CERTREQ) clients an alternate one.
+pub fn client_sent_certreq(sa: &CompletedSaInit, request: &[u8]) -> bool {
+    let Ok((first, inner)) = open_encrypted_gcm(request, &sa.keys.sk_ei) else {
+        return false;
+    };
+    payloads(first, &inner)
+        .flatten()
+        .any(|p| p.payload_type == PayloadType::CertRequest)
 }
 
 /// Initiator: decrypt + verify the responder's `IKE_AUTH` response. Returns the

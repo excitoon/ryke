@@ -52,6 +52,10 @@ fn main() {
         0xEA9_0001,
         verify,
     );
+    if a.iter().any(|x| x == "--certreq") {
+        init.set_send_certreq(true);
+        println!("→ sending a CERTREQ in the first message (mimicking strongSwan)");
+    }
     let mut msg = init.start(&mut entropy).expect("build EAP start");
     for step in 0..12 {
         sock.send_to(&msg, ike).unwrap();

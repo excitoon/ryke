@@ -278,6 +278,56 @@ pub fn derive_session_keys(
     }
 }
 
+/// Derive new IKE keys for an **IKE-SA rekey** (RFC 7296 §2.18). Unlike
+/// [`derive_session_keys`], SKEYSEED is keyed by the *old* SK_d and covers the new
+/// DH shared secret:
+///
+/// ```text
+/// SKEYSEED = prf(SK_d(old), g^ir | Ni | Nr)
+/// {SK_d | SK_ai | SK_ar | SK_ei | SK_er | SK_pi | SK_pr}
+///     = prf+(SKEYSEED, Ni | Nr | SPIi | SPIr)   (the NEW IKE SPIs)
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub fn derive_rekey_session_keys(
+    sk_d_old: &[u8],
+    shared_secret: &[u8],
+    ni: &[u8],
+    nr: &[u8],
+    spi_i: u64,
+    spi_r: u64,
+    lengths: KeyLengths,
+) -> SessionKeys {
+    let mut data = Vec::with_capacity(shared_secret.len() + ni.len() + nr.len());
+    data.extend_from_slice(shared_secret);
+    data.extend_from_slice(ni);
+    data.extend_from_slice(nr);
+    let skeyseed = prf(sk_d_old, &data);
+
+    let mut seed = Vec::with_capacity(ni.len() + nr.len() + 16);
+    seed.extend_from_slice(ni);
+    seed.extend_from_slice(nr);
+    seed.extend_from_slice(&spi_i.to_be_bytes());
+    seed.extend_from_slice(&spi_r.to_be_bytes());
+
+    let total = 3 * lengths.prf + 2 * lengths.integ + 2 * lengths.encr;
+    let km = prf_plus(&skeyseed, &seed, total);
+    let mut off = 0;
+    let mut take = |n: usize| {
+        let slice = km[off..off + n].to_vec();
+        off += n;
+        slice
+    };
+    SessionKeys {
+        sk_d: take(lengths.prf),
+        sk_ai: take(lengths.integ),
+        sk_ar: take(lengths.integ),
+        sk_ei: take(lengths.encr),
+        sk_er: take(lengths.encr),
+        sk_pi: take(lengths.prf),
+        sk_pr: take(lengths.prf),
+    }
+}
+
 /// ESP/AH CHILD SA keys, in the order `KEYMAT` provides them (RFC 7296 §2.17).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildKeys {

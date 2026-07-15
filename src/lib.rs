@@ -60,10 +60,13 @@ pub use ikev2::exchange::{
 pub use ikev2::natt::{
     is_ike_on_4500, unwrap_ike_4500, wrap_ike_4500, NON_ESP_MARKER,
 };
+pub use ikev2::informational::{build_informational, dpd_request, open_informational};
+pub use ikev2::rekey::responder_process_rekey;
+pub use ikev2::ike_rekey::{is_ike_sa_rekey, responder_process_ike_rekey};
 pub use ikev2::ike_auth::{
-    esp_offer, initiator_auth_request, initiator_eap_request, initiator_verify_auth,
-    is_eap_request, peer_id_from_auth, responder_process_auth, AssignedConfig, AuthConfig,
-    LocalAuth, PeerAuth,
+    client_sent_certreq, esp_offer, initiator_auth_request, initiator_eap_request,
+    initiator_verify_auth, is_eap_request, peer_id_from_auth, peer_id_from_request,
+    responder_process_auth, AssignedConfig, AuthConfig, LocalAuth, PeerAuth,
 };
 pub use ikev2::message::{
     payloads, ExchangeType, Flags, IkeHeader, MessageBuilder, PayloadIter, PayloadType, RawPayload,
